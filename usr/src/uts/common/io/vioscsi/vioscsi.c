@@ -25,10 +25,6 @@
 #include "virtiovar.h"
 #include "virtioreg.h"
 
-#if !defined (__packed)
-#define __packed __attribute__((packed))
-#endif /* __packed */
-
 #define VIRTIO_SCSI_CDB_SIZE 32
 #define	VIRTIO_SCSI_SENSE_SIZE 96
 
@@ -81,6 +77,10 @@
 #define VIRTIO_SCSI_EVT_RESET_HARD	0
 #define VIRTIO_SCSI_EVT_RESET_RESCAN	1
 #define VIRTIO_SCSI_EVT_RESET_REMOVED	2
+
+#ifndef __packed
+#define __packed __attribute__((packed))
+#endif
 
 /* Data structures */
 
@@ -156,10 +156,13 @@ struct virtio_scsi_request {
 	struct vq_entry  *req_ve; /* VQ entry we are using */
 	/* first buffer is for virtio scsi headers/stuff */
 	/* second one - for data payload */
-	struct virtio_scsi_buffer req_buf[2];
+	struct virtio_scsi_buffer virtio_headers_buf;
 
 	boolean_t dir; /* request direction (to/from HBA) */
 	int polling_done; /* true if the request is completed */
+
+	unsigned char scbp[DEFAULT_SCBLEN];
+	unsigned char cdbp[DEFAULT_CDBLEN];
 };
 
 struct virtio_scsi_ld {
@@ -206,12 +209,6 @@ static int vioscsi_tran_bus_config(dev_info_t *, uint_t, ddi_bus_config_op_t,
 		void *, dev_info_t **);
 
 static int vioscsi_tran_bus_reset(dev_info_t *hba_dip, int level);
-static struct scsi_pkt *vioscsi_tran_init_pkt(struct scsi_address *ap,
-		struct scsi_pkt *pkt, struct buf *bp, int cmdlen,
-		int statuslen, int tgtlen, int flags,
-		int (*callback)(caddr_t), caddr_t arg);
-static void vioscsi_tran_destroy_pkt(struct scsi_address *ap,
-		struct scsi_pkt *pkt);
 
 static void vioscsi_tran_dma_free(struct scsi_address *ap, struct scsi_pkt *pkt);
 static void vioscsi_tran_sync_pkt(struct scsi_address *ap, struct scsi_pkt *pkt);
@@ -294,6 +291,7 @@ static ddi_dma_attr_t virtio_scsi_data_dma_attr = {
 	0,				/* dma_attr_flags	*/
 };
 
+
 /* SCSI HBA stuff going below */
 static int
 vioscsi_tran_tgt_probe(struct scsi_device *sd, int (*waitfunc)(void))
@@ -355,6 +353,7 @@ vioscsi_find_child(struct virtio_scsi_softc *sc, uint16_t tgt, uint8_t lun)
 	return child;
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_tgt_init(dev_info_t *hba_dip,
 		 dev_info_t *tgt_dip, scsi_hba_tran_t *hba_tran,
@@ -387,6 +386,7 @@ vioscsi_tran_tgt_init(dev_info_t *hba_dip,
 	return (DDI_SUCCESS);
 }
 
+/* ARGSUSED */
 static void
 vioscsi_tran_tgt_free(dev_info_t *hba_dip, dev_info_t *tgt_dip,
 			scsi_hba_tran_t *hba_tran, struct scsi_device *sd)
@@ -404,10 +404,8 @@ vioscsi_tran_start(struct scsi_address *ap, struct scsi_pkt *pkt)
 	struct virtio_scsi_request *req = pkt->pkt_ha_private;
 	struct virtio_scsi_softc *sc = ap->a_hba_tran->tran_hba_private;
 	struct virtio_scsi_cmd_req *cmd_req = NULL;
-//		(struct virtio_scsi_cmd_req *)req->req_buf[0].buffer_virt;
 
-	struct virtio_scsi_buffer *req_buf = &req->req_buf[0];
-	struct virtio_scsi_buffer *payload_buf = &req->req_buf[1];
+	struct virtio_scsi_buffer *req_buf = &req->virtio_headers_buf;
 	int i;
 
 	cmd_req = (struct virtio_scsi_cmd_req *)req_buf->buffer_virt;
@@ -423,11 +421,11 @@ vioscsi_tran_start(struct scsi_address *ap, struct scsi_pkt *pkt)
 	cmd_req->crn = 0;
 
 	if (pkt->pkt_cdbp == NULL) {
-		printf("pkt with NULL CDB! pkt at 0x%p\n", pkt);
+		printf("pkt with NULL CDB! pkt at 0x%p\n", (void *)pkt);
 		return (TRAN_BADPKT);
 	}
 
-	memcpy(cmd_req->cdb, pkt->pkt_cdbp, pkt->pkt_cdblen);
+	(void) memcpy(cmd_req->cdb, pkt->pkt_cdbp, pkt->pkt_cdblen);
 
 	/* allocate vq_entry */
 	ve = vq_alloc_entry(sc->sc_request_vq);
@@ -452,28 +450,14 @@ vioscsi_tran_start(struct scsi_address *ap, struct scsi_pkt *pkt)
 			sizeof(struct virtio_scsi_cmd_resp), B_FALSE);
 
 	/* add some payload, if any */
-	if (payload_buf->state == VIRTIO_SCSI_BUFFER_ALLOCATED) {
-
-		/* TODO : we are using indirect descriptor capability to put all windows and all cookies */
-		/* into one request. the indirect desc gives us with 128 mem buffers (win*cookies) per descriptor */
-		/* but we need to implement DMA moving logic anyway, at least for robustness */
-		for (i = 0; i < payload_buf->buffer_nwins; i ++) {
-			off_t offset;
-			size_t lenp;
-
-			/* add all cookies from the current window */
-			virtio_ve_add_cookie(ve,
-				payload_buf->buffer_dmah,
-				payload_buf->buffer_dmac,
-				payload_buf->buffer_ncookies, req->dir);
-			/* move to the next window */
-			(void) ddi_dma_getwin(payload_buf->buffer_dmah,
-				 i + 1, &offset, &lenp,
-				 &payload_buf->buffer_dmac,
-				 &payload_buf->buffer_ncookies);
+	if (pkt->pkt_numcookies) {
+		ddi_dma_cookie_t *dmac;
+		for (i = 0; i < pkt->pkt_numcookies; i ++) {
+			dmac = &pkt->pkt_cookies[i];
+			virtio_ve_add_indirect_buf(ve, dmac->dmac_laddress,
+				dmac->dmac_size, pkt->pkt_dma_flags & DDI_DMA_WRITE);
 		}
 	}
-	/* set the private stuff */
 	/* FIXME: use virtio_set_private stuff instead of directly pointing */
 	ve->qe_private = req;
 //	virtio_set_private(ve, req);
@@ -497,6 +481,7 @@ vioscsi_tran_start(struct scsi_address *ap, struct scsi_pkt *pkt)
 	return (TRAN_ACCEPT);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_abort(struct scsi_address *ap, struct scsi_pkt *pkt)
 {
@@ -508,12 +493,12 @@ vioscsi_tran_abort(struct scsi_address *ap, struct scsi_pkt *pkt)
 }
 
 static void
-virtio_scsi_buffer_release(struct virtio_scsi_softc *sc, struct virtio_scsi_buffer *vb)
+virtio_scsi_buffer_release(struct virtio_scsi_buffer *vb)
 {
 	if (vb->state != VIRTIO_SCSI_BUFFER_ALLOCATED)
 		return;
 
-	ddi_dma_unbind_handle(vb->buffer_dmah);
+	(void) ddi_dma_unbind_handle(vb->buffer_dmah);
 
 	if (vb->buffer_acch)
 		(void) ddi_dma_mem_free(&vb->buffer_acch);
@@ -554,6 +539,7 @@ virtio_scsi_buffer_setup(struct virtio_scsi_softc *sc, struct virtio_scsi_buffer
 	err = ddi_dma_addr_bind_handle(vb->buffer_dmah, NULL, vb->buffer_virt,
 		len, DDI_DMA_READ | DDI_DMA_WRITE, DDI_DMA_SLEEP, NULL,
 		&vb->buffer_dmac, &vb->buffer_ncookies);
+
 	if (err != DDI_SUCCESS) {
 		printf("%s: cannot bind handle, error %d\n", __func__, err);
 		goto release_dma_mem;
@@ -571,170 +557,86 @@ release_dma_mem:
 	return (DDI_FAILURE);
 }
 
+ /* preallocate DMA handles and stuff for requests */
+ /* TODO: update virtio_scsi_buffer_setup to take into account kmflags */
+/* ARGSUSED */
 static int
-virtio_scsi_req_dma_setup(struct virtio_scsi_softc *sc, struct virtio_scsi_request *req, int flags, struct buf *bp)
+virtio_scsi_req_construct(void *buffer, void *user_arg, int kmflags)
 {
-	struct virtio_scsi_buffer *vb = &req->req_buf[1];
-	int dma_flags;
-	int err;
+	struct virtio_scsi_softc *sc = user_arg;
+	struct virtio_scsi_request *req = buffer;
+	struct virtio_scsi_buffer *buf;
 
-	if (vb->state != VIRTIO_SCSI_BUFFER_FREE) {
-		return (DDI_FAILURE);
-	}
+	buf = &req->virtio_headers_buf;
 
-	if (bp->b_flags & B_READ) {
-		req->dir = B_FALSE;
-		dma_flags = DDI_DMA_READ;
-	} else {
-		req->dir = B_TRUE;
-		dma_flags = DDI_DMA_WRITE;
-	}
-	if (flags & PKT_CONSISTENT)
-		dma_flags |= DDI_DMA_CONSISTENT;
-	else
-		dma_flags |= DDI_DMA_STREAMING;
+	buf->state = VIRTIO_SCSI_BUFFER_FREE;
 
-	/* always pass DDI_DMA_PARTIAL to guarantee that buf always */
-	/* can be mapped, even into few DMA windows */
-	dma_flags |= DDI_DMA_PARTIAL;
+	/* allocate DMA resources for the vioscsi headers */
+	/* SCSA will allocate the rest */
+	if (virtio_scsi_buffer_setup(sc, buf, 1024) != DDI_SUCCESS)
+		return (ENOMEM);
 
-	err = ddi_dma_alloc_handle(sc->sc_dev, &virtio_scsi_data_dma_attr,
-		DDI_DMA_SLEEP, NULL, &vb->buffer_dmah);
-	switch (err) {
-		case DDI_SUCCESS:
-			break;
-		/* TODO: count some statistic here */
-		case DDI_DMA_BADATTR:
-
-			bioerror(bp, EFAULT);
-			return (DDI_FAILURE);
-
-		case DDI_DMA_NORESOURCES:
-
-			bioerror(bp, 0);
-			return (DDI_FAILURE);
-
-		case DDI_DMA_TOOBIG:
-
-			bioerror(bp, EINVAL);
-			return (DDI_FAILURE);
-
-		default:
-
-			bioerror(bp, EFAULT);
-			return (DDI_FAILURE);
-	}
-
-	err = ddi_dma_buf_bind_handle(vb->buffer_dmah, bp,
-		 dma_flags, DDI_DMA_SLEEP, NULL,
-		&vb->buffer_dmac, &vb->buffer_ncookies);
-
-	switch (err) {
-
-		case DDI_DMA_MAPPED:
-
-			vb->buffer_nwins = 1;
-			break;
-
-		case DDI_DMA_PARTIAL_MAP:
-
-			if (ddi_dma_numwin(vb->buffer_dmah,
-				 &vb->buffer_nwins) == DDI_SUCCESS)
-			break;
-
-		default:
-
-			ddi_dma_unbind_handle(vb->buffer_dmah);
-			bioerror(bp, EFAULT);
-			return (DDI_FAILURE);
-	}
-	vb->buffer_virt = bp->b_un.b_addr;
-	vb->buffer_size = bp->b_bcount;
-
-	vb->state = VIRTIO_SCSI_BUFFER_ALLOCATED;
-
-	return DDI_SUCCESS;
+	return 0;
 }
 
-static struct scsi_pkt *
-vioscsi_tran_init_pkt(struct scsi_address *ap,
-	struct scsi_pkt *pkt, struct buf *bp, int cmdlen,
-	int statuslen, int tgtlen, int flags,
-	int (*callback)(caddr_t), caddr_t arg)
+/* ARGSUSED */
+static void
+virtio_scsi_req_destruct(void *buffer, void *user_args)
 {
-	struct virtio_scsi_request *req;
-	struct virtio_scsi_softc *sc = ap->a_hba_tran->tran_hba_private;
-	struct scsi_pkt *new_pkt = NULL;
+	struct virtio_scsi_request *req = buffer;
 
-	if (pkt == NULL) {
-		pkt = scsi_hba_pkt_alloc(sc->sc_dev, ap, cmdlen, statuslen,
-			tgtlen, sizeof(struct virtio_scsi_request), callback,
-			arg);
+	virtio_scsi_buffer_release(&req->virtio_headers_buf);
+}
 
-		if (pkt == NULL)
-			return (NULL);
+/* ARGSUSED */
+static int
+vioscsi_tran_setup_pkt(struct scsi_pkt *pkt,
+		int (*callback)(caddr_t), caddr_t arg)
+{
+	/* nothing to do, all resources are already preallocated */
+	return 0;
+}
 
-		new_pkt = pkt;
-		req = pkt->pkt_ha_private;
-	}
-	else {
-		req = pkt->pkt_ha_private;
-		new_pkt = NULL;
-	}
+/* ARGSUSED */
+static void
+vioscsi_tran_teardown_pkt(struct scsi_pkt *pkt)
+{
+	/* nothing to do. resources will be released by packet destructor */
+}
 
-	memset(req, 0, sizeof(* req));
+static int
+vioscsi_tran_pkt_constructor(struct scsi_pkt *pkt, scsi_hba_tran_t *tran,
+	int kmflags)
+{
+	struct virtio_scsi_request *req = pkt->pkt_ha_private;
+	struct virtio_scsi_softc *sc = tran->tran_hba_private;
 
-	req->req_buf[0].state = VIRTIO_SCSI_BUFFER_FREE;
-	req->req_buf[1].state = VIRTIO_SCSI_BUFFER_FREE;
+	(void) memset(req, 0, sizeof(*req));
 	req->req_pkt = pkt;
 
-	/* setup the VIRTIO SCSI request things */
-	/* TODO: do some refractoring, probably merge virtio_scsi_buffer_setup and virtio_scsi_req_dma_setup */
-	if (virtio_scsi_buffer_setup(sc, &req->req_buf[0], 1024) != DDI_SUCCESS) {
-		scsi_hba_pkt_free(ap, new_pkt);
-		return (NULL);
-	}
-
-	if (bp && bp->b_bcount != 0) {
-		if (virtio_scsi_req_dma_setup(sc, req, pkt->pkt_flags, bp) != DDI_SUCCESS) {
-			virtio_scsi_buffer_release(sc, &req->req_buf[0]);
-			scsi_hba_pkt_free(ap, new_pkt);
-			return (NULL);
-		}
-	}
-	return (pkt);
+	return virtio_scsi_req_construct(req, sc, kmflags);
 }
 
 static void
-vioscsi_tran_destroy_pkt(struct scsi_address *ap, struct scsi_pkt *pkt)
+vioscsi_tran_pkt_destructor(struct scsi_pkt *pkt, scsi_hba_tran_t *tran)
 {
-	struct virtio_scsi_request *req;
-	struct virtio_scsi_softc *sc = ap->a_hba_tran->tran_hba_private;
+	struct virtio_scsi_request *req = pkt->pkt_ha_private;
+	struct virtio_scsi_softc *sc = tran->tran_hba_private;
 
-	req = pkt->pkt_ha_private;
-
-	if (!req)
-		return;
-
-	if (!pkt)
-		return;
-
-	virtio_scsi_buffer_release(sc, &req->req_buf[0]);
-	virtio_scsi_buffer_release(sc, &req->req_buf[1]);
-
-	scsi_hba_pkt_free(ap, pkt);
+	virtio_scsi_req_destruct(req, sc);
 }
 
+/* TODO: do we really need this callback ? */
+/* ARGSUSED */
 static void
 vioscsi_tran_dma_free(struct scsi_address *ap, struct scsi_pkt *pkt)
 {
 	struct virtio_scsi_request *req = pkt->pkt_ha_private;
-	struct virtio_scsi_softc *sc = ap->a_hba_tran->tran_hba_private;
 
-	virtio_scsi_buffer_release(sc, &req->req_buf[0]);
-	virtio_scsi_buffer_release(sc, &req->req_buf[1]);
+	virtio_scsi_buffer_release(&req->virtio_headers_buf);
 }
 
+/* ARGSUSED */
 static void
 vioscsi_tran_sync_pkt(struct scsi_address *ap, struct scsi_pkt *pkt)
 {
@@ -742,6 +644,7 @@ vioscsi_tran_sync_pkt(struct scsi_address *ap, struct scsi_pkt *pkt)
 	return;
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_getcap(struct scsi_address *ap, char *cap, int whom)
 {
@@ -802,14 +705,15 @@ vioscsi_tran_getcap(struct scsi_address *ap, char *cap, int whom)
 	return (rval);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_setcap(struct scsi_address *ap, char *cap, int value, int whom)
 {
 	int rval = 1;
 
-	if (cap == NULL || whom == 0)
+	if (cap == NULL || whom == 0) {
 		return (-1);
-
+	}
 	switch (scsi_hba_lookup_capstr(cap)) {
 		default:
 			rval = 1;
@@ -817,23 +721,25 @@ vioscsi_tran_setcap(struct scsi_address *ap, char *cap, int value, int whom)
 	return (rval);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_reset(struct scsi_address *ap, int level)
 {
 	/* TODO: implement RESET for VIRTIO SCSI */
-	return DDI_FAILURE;
+	return (DDI_FAILURE);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_reset_notify(struct scsi_address *ap, int flags,
 			void (*callback)(caddr_t), caddr_t arg)
 {
 	/* TODO: implement RESET for VIRTIO SCSI */
-	return DDI_FAILURE;
+	return (DDI_FAILURE);
 }
 
 static int
-virtio_scsi_probe_lun(struct virtio_scsi_softc *sc, struct scsi_device *sd)
+virtio_scsi_probe_lun(struct scsi_device *sd)
 {
 	int rval;
 	int probe_result;
@@ -841,7 +747,7 @@ virtio_scsi_probe_lun(struct virtio_scsi_softc *sc, struct scsi_device *sd)
 	probe_result = scsi_hba_probe(sd, NULL_FUNC);
 
 	rval =  (probe_result == SCSIPROBE_EXISTS) ? NDI_SUCCESS : NDI_FAILURE;
-	return rval;
+	return (rval);
 }
 
 static int
@@ -926,7 +832,7 @@ virtio_scsi_config_lun(struct virtio_scsi_softc *sc, int tgt, uint8_t lun, dev_i
 	sd.sd_address.a_target = (uint16_t)tgt;
 	sd.sd_address.a_lun = (uint8_t)lun;
 
-	if ((rval = virtio_scsi_probe_lun(sc, &sd)) == NDI_SUCCESS)
+	if ((rval = virtio_scsi_probe_lun(&sd)) == NDI_SUCCESS)
 		rval = virtio_scsi_config_child(sc, &sd, ldip);
 
 	if (sd.sd_inq) {
@@ -978,13 +884,13 @@ virtio_scsi_parse_devname(char *devnm, int *tgt, int *lun)
 	return (DDI_SUCCESS);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_bus_config(dev_info_t *hba_dip, uint_t flags, ddi_bus_config_op_t
 op,  void *arg, dev_info_t **childs)
 {
 	int circ;
-	int ret = DDI_FAILURE;
-	char *ptr = NULL;
+	int ret = DDI_SUCCESS;
 	int tgt, lun;
 
 	struct virtio_scsi_softc *sc = global_virtio_scsi_softc;
@@ -996,7 +902,7 @@ op,  void *arg, dev_info_t **childs)
 	/* currently supported set is enough for sd */
 	switch (op) {
 		case BUS_CONFIG_ONE:
-			if ((ptr = strchr((char *)arg, '@')) == NULL) {
+			if (strchr((char *)arg, '@') == NULL) {
 				ret = DDI_FAILURE;
 				goto out;
 			}
@@ -1009,8 +915,7 @@ op,  void *arg, dev_info_t **childs)
 			if (lun == 0) {
 				ret = virtio_scsi_config_lun(sc, tgt, lun, childs);
 			}
-			else
-			{
+			else {
 				ret = NDI_FAILURE;
 			}
 			goto out;
@@ -1018,32 +923,31 @@ op,  void *arg, dev_info_t **childs)
 		case BUS_CONFIG_DRIVER:
 		case BUS_CONFIG_ALL: {
 
-			uint32_t tgt, bus;
-			uint32_t i, total;
+			uint32_t tgt;
 
 			for (tgt = 0; tgt  < sc->sc_max_target; tgt ++) {
-				virtio_scsi_config_lun(sc, tgt, 0, NULL);
+				(void) virtio_scsi_config_lun(sc, tgt, 0, NULL);
 			}
 
-		}
-		ret = DDI_SUCCESS;
 		default:
-			ret = DDI_FAILURE;
+			ret = NDI_FAILURE;
+		}
+
 	}
 out:
 	ndi_devi_exit(hba_dip, circ);
 	return (ret);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_bus_reset(dev_info_t *hba_dip, int level)
 {
-	int circ;
-
 	/*TODO: implement bus reset? */
-	return DDI_FAILURE;
+	return (DDI_FAILURE);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_bus_quiesce(dev_info_t *hba_dip)
 {
@@ -1052,15 +956,16 @@ vioscsi_tran_bus_quiesce(dev_info_t *hba_dip)
 	/* and notify the host SCSI bus somehow that we are stopped. not sure if current virtio SCSI */
 	/* provides such a capability */
 	printf("%s: called!\n", __FUNCTION__);
-	return DDI_SUCCESS;
+	return (DDI_SUCCESS);
 }
 
+/* ARGSUSED */
 static int
 vioscsi_tran_bus_unquiesce(dev_info_t *hba_dip)
 {
 	/* TODO: the same comment as for virtio_tran_bus_quiesce */
 	printf("%s: called!\n", __FUNCTION__);
-	return DDI_SUCCESS;
+	return (DDI_SUCCESS);
 }
 
 /* ARGSUSED */
@@ -1077,7 +982,6 @@ vioscsi_intr_handler(caddr_t arg1, caddr_t arg2)
 	struct scsi_pkt *pkt;
 	uint32_t len;
 	struct virtio_scsi_buffer *req_buf = NULL;
-	struct virtio_scsi_buffer *payload_buf = NULL;
 
 	/* TODO: push request into the ready queue and schedule taskq */
 	while ((ve = virtio_pull_chain(sc->sc_request_vq, &len)))
@@ -1088,8 +992,7 @@ vioscsi_intr_handler(caddr_t arg1, caddr_t arg2)
 
 		pkt = req->req_pkt;
 
-		req_buf = &req->req_buf[0];
-		payload_buf = &req->req_buf[1];
+		req_buf = &req->virtio_headers_buf;
 
 		resp = (struct virtio_scsi_cmd_resp *)(req_buf->buffer_virt + sizeof(struct virtio_scsi_cmd_req));
 
@@ -1115,7 +1018,7 @@ vioscsi_intr_handler(caddr_t arg1, caddr_t arg2)
 							arqstat->sts_rqpkt_state = STATE_GOT_BUS |
 								 STATE_GOT_TARGET | STATE_SENT_CMD | STATE_XFERRED_DATA;
 							*(uint8_t *)&arqstat->sts_rqpkt_status = STATUS_GOOD;
-							memcpy(&arqstat->sts_sensedata, resp->sense, resp->sense_len);
+							(void) memcpy(&arqstat->sts_sensedata, resp->sense, resp->sense_len);
 						}
 				}
 				pkt->pkt_resid = 0;
@@ -1153,6 +1056,7 @@ vioscsi_register_ints(struct virtio_scsi_softc *sc)
 	return (ret);
 }
 
+/* ARGSUSED */
 static int
 virtio_scsi_getinfo(dev_info_t *devinfo, ddi_info_cmd_t cmd, void *arg,
 	void **resultp)
@@ -1183,22 +1087,20 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	int instance;
 	struct virtio_scsi_softc *sc;
 	struct virtio_softc *vsc;
-	int i;
 	scsi_hba_tran_t *hba_tran;
 
 	instance = ddi_get_instance(devinfo);
 
+	printf("%s: kmem_cached SCSA version\n", __func__);
 	switch (cmd) {
 	case DDI_ATTACH:
 		break;
 
 	case DDI_RESUME:
 	case DDI_PM_RESUME:
-		dev_err(devinfo, CE_WARN, "resume not supported yet");
 		ret = DDI_FAILURE;
 
 	default:
-		dev_err(devinfo, CE_WARN, "cmd 0x%x not recognized", cmd);
 		ret = DDI_FAILURE;
 	}
 
@@ -1218,7 +1120,6 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	    0, 0, &virtio_scsi_acc_attr, &sc->sc_virtio.sc_ioh);
 
 	if (ret != DDI_SUCCESS) {
-		dev_err(devinfo, CE_WARN, "unable to map bar0: [%d]", ret);
 		goto exit_sc;
 	}
 
@@ -1254,8 +1155,7 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 			VIRTIO_SCSI_CFG_SEG_MAX);
 
 	if (vioscsi_register_ints(sc)) {
-		dev_err(devinfo, CE_WARN, "Unable to add interrupt");
-		goto enable_intrs;
+		goto enable_intrs_fail;
 	}
 	/* allocate queues */
 
@@ -1263,7 +1163,7 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	sc->sc_control_vq = virtio_alloc_vq(&sc->sc_virtio, 0,
 		0, 128, "Virtio SCSI control queue");
 	if (sc->sc_control_vq == NULL) {
-		goto enable_intrs;
+		goto enable_intrs_fail;
 	}
 	sc->sc_event_vq = virtio_alloc_vq(&sc->sc_virtio, 1,
 		0, 128, "Virtio SCSI event queue");
@@ -1282,6 +1182,7 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 
 	sc->sc_hba_tran = hba_tran;
 
+	hba_tran->tran_hba_len = sizeof(struct virtio_scsi_request);
 	hba_tran->tran_hba_private = sc;
 	hba_tran->tran_tgt_private = NULL;
 	hba_tran->tran_tgt_init = vioscsi_tran_tgt_init;
@@ -1293,8 +1194,12 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	hba_tran->tran_reset = vioscsi_tran_reset;
 	hba_tran->tran_getcap = vioscsi_tran_getcap;
 	hba_tran->tran_setcap = vioscsi_tran_setcap;
-	hba_tran->tran_init_pkt = vioscsi_tran_init_pkt;
-	hba_tran->tran_destroy_pkt = vioscsi_tran_destroy_pkt;
+
+	hba_tran->tran_setup_pkt = vioscsi_tran_setup_pkt;
+	hba_tran->tran_teardown_pkt = vioscsi_tran_teardown_pkt;
+	hba_tran->tran_pkt_constructor = vioscsi_tran_pkt_constructor;
+	hba_tran->tran_pkt_destructor = vioscsi_tran_pkt_destructor;
+
 	hba_tran->tran_dmafree = vioscsi_tran_dma_free;
 	hba_tran->tran_sync_pkt = vioscsi_tran_sync_pkt;
 	hba_tran->tran_reset_notify = vioscsi_tran_reset_notify;
@@ -1304,10 +1209,9 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	hba_tran->tran_bus_config = vioscsi_tran_bus_config;
 
 	ret = scsi_hba_attach_setup(devinfo, &virtio_scsi_data_dma_attr,
-			 hba_tran, SCSI_HBA_TRAN_CLONE);
+			 hba_tran, SCSI_HBA_TRAN_CLONE | SCSI_HBA_TRAN_CDB | SCSI_HBA_TRAN_SCB);
 	if (ret != DDI_SUCCESS) {
-		dev_err(devinfo, CE_WARN, "Failed to attach scsi hba");
-		goto release_event;
+		goto release_request;
 	}
 
 	if (ddi_create_minor_node(devinfo, "devctl", S_IFCHR,
@@ -1317,15 +1221,20 @@ virtio_scsi_attach(dev_info_t *devinfo, ddi_attach_cmd_t cmd)
 	/* FIXME: have to destroy devctl node */
 	if (ddi_create_minor_node(devinfo, "scsi", S_IFCHR,
 		INST2DEVCTL(instance), DDI_NT_SCSI_ATTACHMENT_POINT, 0) != DDI_SUCCESS) {
+
+		(void) ddi_remove_minor_node(devinfo, "devctl");
 		goto detach_hba;
 	}
 	ddi_report_dev(devinfo);
 
-	virtio_enable_ints(&sc->sc_virtio);
+	(void) virtio_enable_ints(&sc->sc_virtio);
 	return (DDI_SUCCESS);
 
 detach_hba:
-	scsi_hba_detach(devinfo);
+	(void) scsi_hba_detach(devinfo);
+
+release_request:
+	virtio_free_vq(sc->sc_request_vq);
 
 release_event:
 	virtio_free_vq(sc->sc_event_vq);
@@ -1333,7 +1242,7 @@ release_event:
 release_control:
 	virtio_free_vq(sc->sc_control_vq);
 
-enable_intrs:
+enable_intrs_fail:
 	ddi_regs_map_free(&sc->sc_virtio.sc_ioh);
 
 exit_sc:
@@ -1341,16 +1250,21 @@ exit_sc:
 	return (DDI_FAILURE);
 }
 
+/* ARGSUSED */
 static int virtio_scsi_quiesce(dev_info_t *devinfo)
 {
-	return DDI_SUCCESS;
+	return (DDI_SUCCESS);
 }
 
-/* TODO: implement detach */
+/* ARGSUSED */
 static int
 virtio_scsi_detach(dev_info_t *devinfo, ddi_detach_cmd_t cmd)
 {
-	struct virtio_scsi_softc *sc = ddi_get_driver_private(devinfo);
+	struct virtio_scsi_softc *sc;
+
+	if ((sc = ddi_get_driver_private(devinfo)) == NULL) {
+		return (DDI_FAILURE);
+	}
 
 	switch (cmd) {
 	case DDI_DETACH:
@@ -1365,12 +1279,32 @@ virtio_scsi_detach(dev_info_t *devinfo, ddi_detach_cmd_t cmd)
 		return (DDI_FAILURE);
 	}
 
-	return (DDI_FAILURE);
+	virtio_stop_vq_intr(sc->sc_request_vq);
+
+	virtio_release_ints(&sc->sc_virtio);
+
+	/* SCSA will take care about kmem cache destruction */
+	if (scsi_hba_detach(devinfo) != DDI_SUCCESS) {
+		return (DDI_FAILURE);
+	}
+	virtio_free_vq(sc->sc_request_vq);
+	virtio_free_vq(sc->sc_event_vq);
+	virtio_free_vq(sc->sc_control_vq);
+
+	(void) ddi_remove_minor_node(devinfo, "scsi");
+	(void) ddi_remove_minor_node(devinfo, "devctl");
+
+	kmem_free(sc, sizeof(* sc));
+
+	return (DDI_SUCCESS);
 }
 
 int _init(void)
 {
-	int err;
+	int err = 0;
+
+	if (err != 0)
+		return DDI_FAILURE;
 
 	err = scsi_hba_init(&modlinkage);
 
